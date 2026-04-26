@@ -23,7 +23,7 @@
 
 #define UNDEFINED { cpu->eip = saved_ip; return INT_UNDEFINED; }
 
-static bool modrm_compute(struct cpu_state *cpu, struct tlb *tlb, addr_t *addr_out,
+static inline bool modrm_compute(struct cpu_state *cpu, struct tlb *tlb, addr_t *addr_out,
         struct modrm *modrm, struct regptr *modrm_regptr, struct regptr *modrm_base);
 #define READMODRM \
     if (!modrm_compute(cpu, tlb, &addr, &modrm, &modrm_regptr, &modrm_base)) { \
@@ -585,47 +585,51 @@ static bool modrm_compute(struct cpu_state *cpu, struct tlb *tlb, addr_t *addr_o
 
 // reads a modrm and maybe sib byte, computes the address, and adds it to
 // *addr_out, returns false if segfault while reading the bytes
-static bool modrm_compute(struct cpu_state *cpu, struct tlb *tlb, addr_t *addr_out,
+static inline bool modrm_compute(struct cpu_state *cpu, struct tlb *tlb, addr_t *addr_out,
         struct modrm *modrm, struct regptr *modrm_regptr, struct regptr *modrm_base) {
-    if (!modrm_decode32(&cpu->eip, tlb, modrm))
+    if (unlikely(!modrm_decode32(&cpu->eip, tlb, modrm)))
         return false;
     *modrm_regptr = regptr_from_reg(modrm->reg);
-    *modrm_base = regptr_from_reg(modrm->base);
-    if (modrm->type == modrm_reg)
+    if (modrm->type == modrm_reg) {
+        *modrm_base = regptr_from_reg(modrm->base);
         return true;
-
-    if (modrm->base != reg_none)
-        *addr_out += REGISTER(*modrm_base, 32);
-    *addr_out += modrm->offset;
-    if (modrm->type == modrm_mem_si) {
-        struct regptr index_reg = regptr_from_reg(modrm->index);
-        *addr_out += REGISTER(index_reg, 32) << modrm->shift;
     }
-    return true;
+
+    if (modrm->base != reg_none) {
+        *modrm_base = regptr_from_reg(modrm->base);
+        *addr_out += REGISTER(*modrm_base, 32);
+    }
+    *addr_out += modrm->offset;
+    if (modrm->type == modrm_mem_si)
+        *addr_out += REGISTER(regptr_from_reg(modrm->index), 32) << modrm->shift;
+    return modrm->type == modrm_mem || modrm->type == modrm_mem_si;
 }
 
 flatten __no_instrument void cpu_run(struct cpu_state *cpu) {
-    int i = 0;
-    struct tlb tlb = {.mem = cpu->mem};
+    int timer_budget = 100001;
+    typeof(cpu->mem) mem = cpu->mem;
+    struct tlb tlb = {.mem = mem};
     tlb_flush(&tlb);
-    read_lock(&cpu->mem->lock, __FILE__, __LINE__);
-    int changes = cpu->mem->changes;
+    read_lock(&mem->lock, __FILE__, __LINE__);
+    int changes = mem->changes;
     while (true) {
         int interrupt = cpu_step32(cpu, &tlb);
-        if (interrupt == INT_NONE && i++ >= 100000) {
-            i = 0;
+        if (!unlikely(interrupt != INT_NONE) && unlikely(--timer_budget == 0)) {
+            timer_budget = 100001;
             interrupt = INT_TIMER;
         }
-        if (interrupt != INT_NONE) {
+        if (unlikely(interrupt != INT_NONE)) {
             cpu->trapno = interrupt;
-            read_unlock(&cpu->mem->lock, __FILE__, __LINE__);
+            read_unlock(&mem->lock, __FILE__, __LINE__);
             handle_interrupt(interrupt);
-            read_lock(&cpu->mem->lock, __FILE__, __LINE__);
-            if (tlb.mem != cpu->mem)
-                tlb.mem = cpu->mem;
-            if (cpu->mem->changes != changes) {
+            mem = cpu->mem;
+            read_lock(&mem->lock, __FILE__, __LINE__);
+            if (tlb.mem != mem)
+                tlb.mem = mem;
+            int mem_changes = mem->changes;
+            if (mem_changes != changes) {
                 tlb_flush(&tlb);
-                changes = cpu->mem->changes;
+                changes = mem_changes;
             }
         }
     }
